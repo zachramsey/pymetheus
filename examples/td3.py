@@ -1,6 +1,6 @@
 
 from copy import deepcopy
-from pymetheus.buffer import Buffer
+from pymetheus.buffer import SumTree as Buffer
 from pymetheus.environment import Gymnasium
 from pymetheus.policy import Policy, MLPPolicy
 from pymetheus.policy.wrapper import EpsilonGreedyPolicy
@@ -8,24 +8,26 @@ from pymetheus.modules import TargetPolicySmoothing
 from pymetheus.value import Value, MLPValue
 from pymetheus.value.wrapper import EnsembleValue
 from pymetheus.estimate import Estimate, TD0
-from pymetheus.utils import disable_grads, enable_grads, polyak_update, prefix_keys
-from tensordict import TensorDict
+from pymetheus.utils import (
+    disable_grads, enable_grads, polyak_update, prefix_keys)
+from tensordict import TensorDict   # type: ignore
 import torch
+
 
 class TD3(torch.nn.Module):
     def __init__(
         self,
         policy_fn: Policy,
         value_fn: Value,
-        estimate_fn: Estimate,
-        distance_fn: torch.nn.Module,
+        estimate_fn: Estimate
     ):
         super(TD3, self).__init__()
 
-        # Policy and value functions
+        # Policy function
         self.policy_fn = policy_fn
-        self.value_fn = EnsembleValue(value_fn, num_copies=2)   # Clipped double Q-learning
-        
+        # Clipped double Q-learning value function
+        self.value_fn = EnsembleValue(value_fn, num_copies=2)
+
         # Create targets as deep copies
         target_policy_fn = deepcopy(policy_fn)
         target_value_fn = deepcopy(value_fn)
@@ -44,7 +46,6 @@ class TD3(torch.nn.Module):
         # Functions used in value updates
         self.smoothing_reg = TargetPolicySmoothing()
         self.estimate_fn = estimate_fn
-        self.distance_fn = distance_fn
 
     def value_loss(self, batch: TensorDict) -> TensorDict:
         '''
@@ -64,9 +65,9 @@ class TD3(torch.nn.Module):
         -------
         batch : TensorDict
             With new or modified keys:
-            - "next_act": The action selected by the target policy for the next observation.
-            - "next_val": The next value estimate after applying the target policy and value functions.
-            - "val": The Q-value for the current observation and action.
+            - "next_act": Action selected for the next observation.
+            - "next_val": Next value estimate.
+            - "val": Q-value for the current observation and action.
             - "val_loss": The computed value loss.
         '''
         with torch.no_grad():
@@ -89,12 +90,16 @@ class TD3(torch.nn.Module):
         # Compute Q-value for the current observation and action
         # ["obs", "act"] -> ["val"]
         batch = self.value_fn(batch)
-            
+
+        # Compute the TD error
+        # ["val", "next_val"] -> ["td_error"]
+        batch.set("td_error", batch["val"] - batch["next_val"])
+
         # Compute the distance between the current Q-value and backup
-        # ["val", "next_val"] -> ["val_loss"]
-        batch["val_loss"] = torch.mean(
-            self.distance_fn(batch["val"], batch["next_val"])
-        )
+        # ["td_error", "weight"] -> ["val_loss"]
+        batch.set("val_loss", torch.mean(torch.square(batch["td_error"]) *
+                                         batch.get("weight", 1.0)))
+
         return batch
 
     def policy_loss(self, batch: TensorDict) -> TensorDict:
@@ -111,71 +116,81 @@ class TD3(torch.nn.Module):
         -------
         batch : TensorDict
             With new or modified keys:
-            - "act": The action selected by the policy for the current observation.
-            - "val": The Q-value for the current observation and action.
+            - "act": Action selected for the current observation.
+            - "val": Q-value for the current observation and action.
             - "pol_loss": The computed policy loss.
         '''
         # Select action given the current observation and policy
         # ["obs"] -> ["act"]
         batch = self.policy_fn(batch)
-        
+
         # Compute the Q-value for the current observation and action
         # ["obs", "act"] -> ["val"]
         batch = self.value_fn.q1(batch)
-        
+
         # Maximize Q-value by minimizing its negative
         # ["val"] -> ["pol_loss"]
-        batch["pol_loss"] = -torch.mean(batch["val"])
+        batch.set("pol_loss", -torch.mean(batch["val"]))
 
         return batch
 
 
 if __name__ == "__main__":
+    env_id = "Humanoid-v5"  # Gymnasium environment ID
+    policy_lr = 1e-3        # Learning rate for the policy optimizer
+    value_lr = 1e-3         # Learning rate for the value optimizer
+    erb_capacity = 1000000  # Capacity of the experience replay buffer
+    max_episodes = 10000    # Total number of training episodes
+    policy_delay = 1        # Frequency of policy updates
+    gamma = 0.99            # Discount factor
+    tau = 0.005             # Polyak update coefficient
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Initialize the environment
-    environment = Gymnasium(id="Humanoid-v5", render_mode="human").to(device)
+    environment = Gymnasium(id=env_id, render_mode="human").to(device)
     proto_experience = environment.proto_experience
 
     # Initialize the agent
-    policy_delay = 2    # Frequency of policy updates
-    tau = 0.005         # Polyak update coefficient
+    hidden_layers = [1024, 1024]
     agent = TD3(
-        policy_fn=MLPPolicy(proto_experience, hidden_layers=[512, 512, 512]),
-        value_fn=MLPValue(proto_experience, hidden_layers=[512, 512, 512]),
-        estimate_fn=TD0(gamma=0.99),
-        distance_fn=torch.nn.MSELoss()
+        policy_fn=MLPPolicy(proto_experience, hidden_layers=hidden_layers),
+        value_fn=MLPValue(proto_experience, hidden_layers=hidden_layers),
+        estimate_fn=TD0(gamma=gamma),
     ).to(device)
 
     # Optimizers
-    policy_opt = torch.optim.Adam(agent.policy_fn.parameters(), lr=1e-3)
-    value_opt = torch.optim.Adam(agent.value_fn.parameters(), lr=1e-3)
+    policy_opt = torch.optim.Adam(agent.policy_fn.parameters(), lr=policy_lr)
+    value_opt = torch.optim.Adam(agent.value_fn.parameters(), lr=value_lr)
 
     # Initialize the experience replay buffer
-    capacity = Buffer.calc_capacity(proto_experience, megabytes=16000)
-    buffer = Buffer(proto_experience, capacity, batch_size=32)
+    buffer = Buffer(proto_experience,
+                    erb_capacity,
+                    batch_size=256,
+                    priority_key="td_error")
 
     # Initialize experience as a copy of the prototype experience
-    experience = proto_experience.clone().to(device)
+    experience: TensorDict = proto_experience.clone().to(device)
 
     # Initialize the exploration policy
-    explore_policy = EpsilonGreedyPolicy(agent.policy_fn, epsilon=0.1).to(device)
+    collect_policy = EpsilonGreedyPolicy(agent.policy_fn, epsilon=0.1)
+    collect_policy = collect_policy.to(device)
 
     # Main training loop
-    while experience["episode"] < 100000:
+    while experience["episode"] < max_episodes:
 
-        #################################
-        ###  Environment Interaction  ###
-        #################################
+        #############################
+        #  Environment Interaction  #
+        #############################
 
         with torch.no_grad():
             # Move to the next step in the environment
             # ["next_obs"] -> ["obs"]
-            experience["obs"] = experience["next_obs"]
+            experience.set("obs", experience["next_obs"], inplace=True)
 
             # Select action given the current observation and policy
             # ["obs"] -> ["act"]
-            experience = explore_policy(experience)
+            experience = collect_policy(experience)
 
             # Get initial state or feedback for taking the action
             # if ["done"]:  Clear experience, [...] -> ["obs"]
@@ -186,20 +201,26 @@ if __name__ == "__main__":
             # Buffer will automatically discard the initial environment state
             buffer.add(experience)
 
-        ######################
-        ###  Agent Update  ###
-        ######################
+        ##################
+        #  Agent Update  #
+        ##################
 
-        if len(buffer) < buffer._batch_size*10: continue
+        # Only update once the buffer has enough samples
+        if len(buffer) < buffer._batch_size:
+            continue
 
         # Sample a batch of experiences from the buffer
-        batch = buffer.sample().to(device)
+        batch, idcs, _ = buffer.sample()
+        batch = batch.to(device)
 
         # Update value function
         value_opt.zero_grad()
         batch = agent.value_loss(batch)
         batch["val_loss"].backward()
         value_opt.step()
+
+        # Put experience back into the buffer
+        buffer.update(idcs, batch)
 
         # Delayed policy update
         if experience["step"] % policy_delay == 0:
@@ -221,4 +242,8 @@ if __name__ == "__main__":
             polyak_update(agent.target_policy_fn, agent.policy_fn, tau)
 
             if experience["episode"] % 1 == 0:
-                print(f"Episode: {experience['episode'].item():>4} | Step: {experience['step'].item():>4} | Rew: {experience['rew'].item():>16.6f} | Val Loss: {batch['val_loss'].item():>16.6f} | Pol Loss: {batch['pol_loss'].item():>16.6f}")
+                print(f"Episode: {experience['episode'].item():>4} | "
+                      f"Step: {experience['step'].item():>4} | "
+                      f"Rew: {experience['rew'].item():>16.6f} | "
+                      f"Val Loss: {batch['val_loss'].item():>16.6f} | "
+                      f"Pol Loss: {batch['pol_loss'].item():>16.6f}")
